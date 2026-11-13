@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+"""Switch KDE's dark/light global theme at sunset and sunrise, with offsets.
+
+Only two changes per day: dark at sunset minus N minutes, light at sunrise plus M minutes.
+Runs as a systemd user service with a watchdog. If it crashes or hangs, systemd starts
+`recover`, which turns KDE's own sunrise/sunset switching back on and raises an alert.
+
+Commands: install, enable, status, times, restore, failure-test (run/recover are used by systemd).
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import datetime as dt
+import json
+import math
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+APP = "theme-scheduler"
+SERVICE = f"{APP}.service"
+RECOVER_SERVICE = f"{APP}-recover.service"
+TEST_SERVICE = f"{APP}-test.service"
+ACTIVE_STATES = ("active", "activating", "reloading")
+WATCHDOG_SEC = 60
+TEST_WATCHDOG_SEC = 10
+OFFICIAL_ZENITH = 90.833
+UTC = dt.timezone.utc
+UNSET = "__unset__"
+
+HOME = Path.home()
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state")
+BIN_PATH = HOME / ".local/bin" / APP
+UNIT_DIR = CONFIG_HOME / "systemd/user"
+CONFIG_PATH = CONFIG_HOME / APP / "config.toml"
+KNIGHT_RC = CONFIG_HOME / "knighttimerc"
+STATE_DIR = Path(os.environ.get("THEME_SCHEDULER_STATE_DIR") or STATE_HOME / APP)
+ORIGINAL_PATH = STATE_DIR / "original.json"
+ALERT_PATH = STATE_DIR / "alert.json"
+
+KDE_FILE = "kdeglobals"
+AUTO_KEY = ("KDE", "AutomaticLookAndFeel")
+PACKAGE_KEY = ("KDE", "LookAndFeelPackage")
+DEFAULT_LIGHT_KEY = ("KDE", "DefaultLightLookAndFeel")
+DEFAULT_DARK_KEY = ("KDE", "DefaultDarkLookAndFeel")
+BUILTIN_LIGHT = "org.kde.breeze.desktop"
+BUILTIN_DARK = "org.kde.breezedark.desktop"
+SNAPSHOT_KEYS = [AUTO_KEY, PACKAGE_KEY, ("General", "ColorScheme"), ("Icons", "Theme"), ("General", "AccentColor")]
+
+CONFIG_TEMPLATE = """\
+# theme-scheduler settings. Times are your local time.
+# After editing: systemctl --user restart theme-scheduler   (then: theme-scheduler status)
+
+[location]
+# Leave commented out to use the location from KDE Night Light (~/.config/knighttimerc).
+# Example: central London. Replace with your location.
+# latitude = 51.5
+# longitude = -0.12
+
+[schedule]
+# Dark starts this many minutes BEFORE sunset. Negative values mean after sunset.
+dark_minutes_before_sunset = 60
+# Light starts this many minutes AFTER sunrise. Negative values mean before sunrise.
+light_minutes_after_sunrise = 60
+# What counts as sunrise/sunset: 90.833 = official, 96 = civil twilight,
+# 102 = nautical twilight, 108 = astronomical twilight.
+sun_zenith = 90.833
+
+[themes]
+# Leave commented out to use KDE's own dark and light global themes, the ones KDE's
+# automatic switching uses (kdeglobals DefaultDarkLookAndFeel / DefaultLightLookAndFeel).
+# dark = "org.kde.breezedark.desktop"
+# light = "org.kde.breeze.desktop"
+"""
+
+
+class SchedulerError(Exception):
+    pass
+
+
+def log(message: str) -> None:
+    print(f"{APP}: {message}", file=sys.stderr, flush=True)
+
+
+def now_local() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def run(cmd: list[str], timeout: float = 20) -> str:
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise SchedulerError(f"{cmd[0]} timed out after {timeout:g}s") from exc
+    except OSError as exc:
+        raise SchedulerError(f"cannot run {cmd[0]}: {exc}") from exc
+    if done.returncode != 0:
+        raise SchedulerError(f"{cmd[0]} failed: {(done.stderr or done.stdout).strip()}")
+    return done.stdout.strip()
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+
+
+def kread(key: tuple[str, str], default: str | None = None) -> str | None:
+    group, name = key
+    value = run(["kreadconfig6", "--file", KDE_FILE, "--group", group, "--key", name, "--default", UNSET])
+    return default if value == UNSET else value
+
+
+def kwrite(key: tuple[str, str], value: str | None) -> None:
+    group, name = key
+    tail = ["--delete"] if value is None else [value]
+    run(["kwriteconfig6", "--file", KDE_FILE, "--group", group, "--key", name, *tail])
+
+
+def settings_snapshot() -> dict[str, str | None]:
+    return {f"{group}/{name}": kread((group, name)) for group, name in SNAPSHOT_KEYS}
+
+
+def systemctl(*args: str) -> str:
+    return run(["systemctl", "--user", *args], timeout=120)
+
+
+def systemctl_quiet(*args: str) -> None:
+    try:
+        systemctl(*args)
+    except SchedulerError:
+        pass
+
+
+def unit_prop(unit: str, prop: str) -> str:
+    return run(["systemctl", "--user", "show", unit, f"--property={prop}", "--value"])
+
+
+def unit_file_state(unit: str) -> str:
+    done = subprocess.run(["systemctl", "--user", "is-enabled", unit], capture_output=True, text=True)
+    return done.stdout.strip() or "unknown"
+
+
+def journal_has(invocation: str, text: str, timeout: float = 5) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        done = subprocess.run(
+            ["journalctl", "--user", f"_SYSTEMD_INVOCATION_ID={invocation}", "--no-pager", "-o", "cat"],
+            capture_output=True,
+            text=True,
+        )
+        if text in done.stdout:
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.5)
+
+
+def process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def sd_notify(message: str) -> None:
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.connect(address)
+        sock.sendall(message.encode())
+
+
+def watchdog_period() -> float:
+    usec = os.environ.get("WATCHDOG_USEC", "")
+    if usec.isdigit():
+        return min(10.0, int(usec) / 3_000_000)
+    return 10.0
+
+
+def notify(title: str, body: str, critical: bool = False) -> None:
+    run(
+        [
+            "busctl", "--user", "call", "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications", "Notify", "susssasa{sv}i", APP, "0",
+            "dialog-warning" if critical else "preferences-desktop-theme", title, body,
+            "0", "1", "urgency", "y", "2" if critical else "1", "0" if critical else "10000",
+        ],
+        timeout=10,
+    )
+
+
+def _sun_position(jd: float) -> tuple[float, float]:
+    """Solar declination (radians) and equation of time (minutes), NOAA low-precision formulas."""
+    t = (jd - 2451545.0) / 36525.0
+    mean_long = (280.46646 + t * (36000.76983 + t * 0.0003032)) % 360
+    anomaly = math.radians(357.52911 + t * (35999.05029 - 0.0001537 * t))
+    ecc = 0.016708634 - t * (0.000042037 + 0.0000001267 * t)
+    centre = (
+        math.sin(anomaly) * (1.914602 - t * (0.004817 + 0.000014 * t))
+        + math.sin(2 * anomaly) * (0.019993 - 0.000101 * t)
+        + math.sin(3 * anomaly) * 0.000289
+    )
+    omega = math.radians(125.04 - 1934.136 * t)
+    apparent = math.radians(mean_long + centre - 0.00569 - 0.00478 * math.sin(omega))
+    obliq0 = 23 + (26 + (21.448 - t * (46.815 + t * (0.00059 - t * 0.001813))) / 60) / 60
+    obliq = math.radians(obliq0 + 0.00256 * math.cos(omega))
+    decl = math.asin(math.sin(obliq) * math.sin(apparent))
+    y = math.tan(obliq / 2) ** 2
+    l0 = math.radians(mean_long)
+    eqtime = 4 * math.degrees(
+        y * math.sin(2 * l0)
+        - 2 * ecc * math.sin(anomaly)
+        + 4 * ecc * y * math.sin(anomaly) * math.cos(2 * l0)
+        - 0.5 * y * y * math.sin(4 * l0)
+        - 1.25 * ecc * ecc * math.sin(2 * anomaly)
+    )
+    return decl, eqtime
+
+
+def sun_time(day: dt.date, lat: float, lon: float, zenith: float, rising: bool) -> dt.datetime | None:
+    midnight = dt.datetime(day.year, day.month, day.day, tzinfo=UTC)
+    jd0 = midnight.timestamp() / 86400 + 2440587.5
+    lat_r = math.radians(lat)
+    minutes = 720.0
+    for _ in range(2):
+        decl, eqtime = _sun_position(jd0 + minutes / 1440)
+        cos_h = (math.cos(math.radians(zenith)) - math.sin(lat_r) * math.sin(decl)) / (
+            math.cos(lat_r) * math.cos(decl)
+        )
+        if not -1 <= cos_h <= 1:
+            return None
+        hour_angle = math.degrees(math.acos(cos_h))
+        minutes = 720 - 4 * (lon + (hour_angle if rising else -hour_angle)) - eqtime
+    return midnight + dt.timedelta(minutes=minutes)
+
+
+@dataclass(frozen=True)
+class Change:
+    when: dt.datetime
+    state: str
+    base: dt.datetime
+
+
+@dataclass(frozen=True)
+class Schedule:
+    lat: float
+    lon: float
+    zenith: float
+    dark_before_sunset: float
+    light_after_sunrise: float
+
+    def changes(self, now: dt.datetime, span: int = 2) -> list[Change]:
+        day = now.astimezone(UTC).date()
+        found = []
+        for offset in range(-span, span + 1):
+            date = day + dt.timedelta(days=offset)
+            rise = sun_time(date, self.lat, self.lon, self.zenith, rising=True)
+            sunset = sun_time(date, self.lat, self.lon, self.zenith, rising=False)
+            if rise is not None:
+                found.append(Change(rise + dt.timedelta(minutes=self.light_after_sunrise), "light", rise))
+            if sunset is not None:
+                found.append(Change(sunset - dt.timedelta(minutes=self.dark_before_sunset), "dark", sunset))
+        return sorted(found, key=lambda change: change.when)
+
+    def state_at(self, now: dt.datetime) -> str:
+        changes = self.changes(now)
+        past = [change for change in changes if change.when <= now]
+        if not past or len(past) == len(changes):
+            raise SchedulerError("no sunrise or sunset near today at this location (polar day or night?)")
+        return past[-1].state
+
+    def next_change(self, now: dt.datetime) -> Change:
+        for change in self.changes(now):
+            if change.when > now:
+                return change
+        raise SchedulerError("no sunrise or sunset in the next few days at this location")
+
+
+@dataclass(frozen=True)
+class Config:
+    schedule: Schedule
+    location_source: str
+    light_theme: str | None
+    dark_theme: str | None
+
+
+def setting(table: dict, key: str, default: float, low: float, high: float) -> float:
+    value = table.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
+        raise SchedulerError(f"'{key}' must be a number between {low:g} and {high:g}")
+    return float(value)
+
+
+def theme_setting(table: dict, key: str) -> str | None:
+    value = table.get(key)
+    if value is not None and not isinstance(value, str):
+        raise SchedulerError(f"'{key}' must be a package name in quotes")
+    return value or None
+
+
+def knight_location() -> tuple[float, float]:
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(KNIGHT_RC)
+        return float(parser["Location"]["Latitude"]), float(parser["Location"]["Longitude"])
+    except (KeyError, ValueError, configparser.Error) as exc:
+        raise SchedulerError(f"no location: set latitude and longitude under [location] in {CONFIG_PATH}") from exc
+
+
+def load_config() -> Config:
+    raw: dict = {}
+    if CONFIG_PATH.exists():
+        try:
+            raw = tomllib.loads(CONFIG_PATH.read_text())
+        except tomllib.TOMLDecodeError as exc:
+            raise SchedulerError(f"{CONFIG_PATH}: {exc}") from exc
+    location = raw.get("location", {})
+    timing = raw.get("schedule", {})
+    themes = raw.get("themes", {})
+    if "latitude" in location and "longitude" in location:
+        lat = setting(location, "latitude", 0, -90, 90)
+        lon = setting(location, "longitude", 0, -180, 180)
+        source = str(CONFIG_PATH)
+    else:
+        lat, lon = knight_location()
+        source = str(KNIGHT_RC)
+    schedule = Schedule(
+        lat=lat,
+        lon=lon,
+        zenith=setting(timing, "sun_zenith", OFFICIAL_ZENITH, 90, 108),
+        dark_before_sunset=setting(timing, "dark_minutes_before_sunset", 60, -720, 720),
+        light_after_sunrise=setting(timing, "light_minutes_after_sunrise", 60, -720, 720),
+    )
+    return Config(schedule, source, theme_setting(themes, "light"), theme_setting(themes, "dark"))
+
+
+def theme_for(state: str, cfg: Config | None = None) -> str:
+    if state == "dark":
+        override = cfg.dark_theme if cfg else None
+        return override or kread(DEFAULT_DARK_KEY, BUILTIN_DARK)
+    override = cfg.light_theme if cfg else None
+    return override or kread(DEFAULT_LIGHT_KEY, BUILTIN_LIGHT)
+
+
+def apply_theme(package: str) -> bool:
+    if kread(PACKAGE_KEY, BUILTIN_LIGHT) == package:
+        return False
+    for attempt in (1, 2):
+        sd_notify("WATCHDOG=1")
+        try:
+            run(["plasma-apply-lookandfeel", "-a", package, "-k"])
+            break
+        except SchedulerError as exc:
+            if attempt == 2:
+                raise
+            log(f"theme switch failed, retrying once: {exc}")
+    if kread(PACKAGE_KEY, BUILTIN_LIGHT) != package:
+        raise SchedulerError(f"KDE did not switch to {package}")
+    return True
+
+
+def save_original_if_missing() -> None:
+    if ORIGINAL_PATH.exists():
+        return
+    write_json(
+        ORIGINAL_PATH,
+        {
+            "saved": now_local().isoformat(timespec="seconds"),
+            "auto": kread(AUTO_KEY),
+            "package": kread(PACKAGE_KEY),
+        },
+    )
+    log(f"saved your current KDE theme settings to {ORIGINAL_PATH}")
+
+
+def restore_settings(original: dict) -> None:
+    package = original.get("package")
+    apply_theme(package or BUILTIN_LIGHT)
+    if package is None:
+        kwrite(PACKAGE_KEY, None)
+    kwrite(AUTO_KEY, original.get("auto"))
+
+
+def kde_state_now() -> str:
+    schedule = load_config().schedule
+    plain = Schedule(schedule.lat, schedule.lon, OFFICIAL_ZENITH, 0, 0)
+    return plain.state_at(now_local())
+
+
+def describe_failure(unit: str, result: str, status: str) -> str:
+    what = {
+        "watchdog": "hung (watchdog timeout)",
+        "timeout": "timed out",
+        "exit-code": f"crashed (exit code {status})",
+        "signal": f"was killed (signal {status})",
+        "core-dump": f"crashed (signal {status}, core dumped)",
+    }.get(result, f"failed ({result or 'unknown'})")
+    return f"{unit or SERVICE} {what}"
+
+
+def print_changes(changes: list[Change]) -> None:
+    for change in changes:
+        minutes = (change.when - change.base).total_seconds() / 60
+        event = "sunset" if change.state == "dark" else "sunrise"
+        if minutes == 0:
+            reason = f"at {event} {change.base.astimezone():%H:%M}"
+        else:
+            side = "before" if minutes < 0 else "after"
+            reason = f"{abs(minutes):g} min {side} {event} {change.base.astimezone():%H:%M}"
+        print(f"  {change.when.astimezone():%a %d %b %H:%M}  {change.state:<5}  {reason}")
+
+
+def service_unit(description: str, watchdog: int, args: str, state_dir: Path | None = None, install: bool = True) -> str:
+    lines = [
+        "[Unit]",
+        f"Description={description}",
+        "PartOf=graphical-session.target",
+        "After=graphical-session.target",
+        f"OnFailure={RECOVER_SERVICE}",
+        "",
+        "[Service]",
+        "Type=notify",
+        "NotifyAccess=main",
+        f"ExecStart={BIN_PATH} {args}",
+        f"ExecStopPost=-{BIN_PATH} recover --quiet",
+        f"WatchdogSec={watchdog}",
+        "WatchdogSignal=SIGKILL",
+        "TimeoutStartSec=30",
+        "TimeoutStopSec=15",
+        "Restart=no",
+    ]
+    if state_dir is not None:
+        lines.append(f"Environment=THEME_SCHEDULER_STATE_DIR={state_dir}")
+    if install:
+        lines += ["", "[Install]", "WantedBy=graphical-session.target"]
+    return "\n".join(lines) + "\n"
+
+
+def recover_unit() -> str:
+    return (
+        "[Unit]\n"
+        f"Description=Give the KDE theme back to KDE's own sunrise/sunset switching ({APP} failed)\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={BIN_PATH} recover\n"
+        "TimeoutStartSec=90\n"
+    )
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    save_original_if_missing()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    kwrite(AUTO_KEY, "false")
+    log("KDE's automatic switching is off; this scheduler is in control")
+    last = None
+    ready = False
+    while True:
+        sd_notify("WATCHDOG=1")
+        now = now_local()
+        state = cfg.schedule.state_at(now)
+        nxt = cfg.schedule.next_change(now)
+        if state != last:
+            package = theme_for(state, cfg)
+            if args.dry_run:
+                log(f"dry run: would switch to {state} ({package})")
+            elif apply_theme(package):
+                log(f"switched to {state} ({package})")
+            else:
+                log(f"{state} ({package}) already active")
+            last = state
+        if not ready:
+            ALERT_PATH.unlink(missing_ok=True)
+            sd_notify("READY=1")
+            ready = True
+        sd_notify(f"STATUS={state} now, {nxt.state} at {nxt.when.astimezone():%a %H:%M}")
+        time.sleep(max(1.0, min(watchdog_period(), (nxt.when - now).total_seconds())))
+
+
+def cmd_recover(args: argparse.Namespace) -> int:
+    if args.quiet and os.environ.get("SERVICE_RESULT", "success") != "success":
+        return 0
+    unit = os.environ.get("MONITOR_UNIT", "")
+    result = os.environ.get("MONITOR_SERVICE_RESULT", "")
+    status = os.environ.get("MONITOR_EXIT_STATUS", "")
+    problems: list[str] = []
+    try:
+        kwrite(AUTO_KEY, "true")
+    except SchedulerError as exc:
+        problems.append(f"could not turn KDE's automatic switching back on: {exc}")
+    state = "?"
+    try:
+        state = kde_state_now()
+        apply_theme(theme_for(state))
+    except SchedulerError as exc:
+        problems.append(f"could not set KDE's {state} theme: {exc}")
+    log(f"recovery: KDE automatic switching is on, theme set to KDE's {state}")
+    if args.quiet:
+        for problem in problems:
+            log(problem)
+        return 1 if problems else 0
+    what = describe_failure(unit, result, status)
+    body = (
+        f"{what}. KDE's own sunrise/sunset switching is back on, so your offsets are OFF "
+        f"until you restart it: systemctl --user restart {SERVICE}"
+    )
+    if problems:
+        body += " Problems: " + "; ".join(problems)
+    try:
+        notify("Theme scheduler failed", body, critical=True)
+        log("alert notification sent")
+    except SchedulerError as exc:
+        problems.append(f"notification failed: {exc}")
+    write_json(
+        ALERT_PATH,
+        {"time": now_local().isoformat(timespec="seconds"), "unit": unit, "result": result,
+         "status": status, "problems": problems},
+    )
+    for problem in problems:
+        log(problem)
+    return 1 if problems else 0
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(CONFIG_TEMPLATE)
+        log(f"wrote {CONFIG_PATH}")
+    load_config()
+    BIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if Path(__file__).resolve() != BIN_PATH.resolve():
+        shutil.copy2(__file__, BIN_PATH)
+    BIN_PATH.chmod(0o755)
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    (UNIT_DIR / SERVICE).write_text(
+        service_unit("Dark/light KDE theme at sunset and sunrise, with offsets", WATCHDOG_SEC, "run")
+    )
+    (UNIT_DIR / RECOVER_SERVICE).write_text(recover_unit())
+    systemctl("daemon-reload")
+    save_original_if_missing()
+    print(f"Installed. Not enabled yet. Next steps:")
+    print(f"  {APP} status          check the times and your settings")
+    print(f"  {APP} failure-test    deliberately crash and hang a test copy, verify recovery")
+    print(f"  {APP} enable          start now and at every login")
+    print(f"  {APP} restore         undo everything: stop, disable, put back your original settings")
+    return 0
+
+
+def cmd_enable(args: argparse.Namespace) -> int:
+    if not (UNIT_DIR / SERVICE).exists():
+        raise SchedulerError(f"run '{APP} install' first")
+    load_config()
+    systemctl("enable", "--now", SERVICE)
+    print(f"Enabled: the scheduler starts now and at every login. Check it with: {APP} status")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    s = cfg.schedule
+    now = now_local()
+    print(f"Config:    {CONFIG_PATH}")
+    print(f"Location:  {s.lat:.4f}, {s.lon:.4f}  (from {cfg.location_source})")
+    print(f"Rule:      dark {s.dark_before_sunset:g} min before sunset, light {s.light_after_sunrise:g} min after sunrise")
+    print(f"Sun:       zenith {s.zenith:g}")
+    print(f"Themes:    light = {theme_for('light', cfg)}")
+    print(f"           dark  = {theme_for('dark', cfg)}")
+    print(f"Now:       {s.state_at(now)}")
+    print("Next changes:")
+    print_changes([c for c in s.changes(now) if c.when > now][:4])
+    print()
+    print(f"Service:   {unit_prop(SERVICE, 'ActiveState')}, {unit_file_state(SERVICE)}")
+    print(f"KDE:       automatic switching = {kread(AUTO_KEY, 'not set')}, theme package = {kread(PACKAGE_KEY, BUILTIN_LIGHT)}")
+    print(f"Saved:     {'your original settings are saved' if ORIGINAL_PATH.exists() else 'nothing saved yet'}")
+    alert = read_json(ALERT_PATH)
+    if alert:
+        what = describe_failure(alert.get("unit", ""), alert.get("result", ""), alert.get("status", ""))
+        print(f"ALERT:     {alert.get('time')}: {what}. Offsets are OFF until the scheduler is restarted.")
+    return 0
+
+
+def cmd_times(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    now = now_local()
+    print_changes([c for c in cfg.schedule.changes(now, span=3) if c.when > now][: args.count])
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    if unit_prop(SERVICE, "ActiveState") in ACTIVE_STATES:
+        systemctl("stop", SERVICE)
+    systemctl_quiet("reset-failed", SERVICE)
+    systemctl_quiet("disable", SERVICE)
+    original = read_json(ORIGINAL_PATH)
+    if original is None:
+        raise SchedulerError(f"no saved settings at {ORIGINAL_PATH}, nothing to restore (scheduler stopped and disabled)")
+    restore_settings(original)
+    ORIGINAL_PATH.unlink()
+    ALERT_PATH.unlink(missing_ok=True)
+    summary = f"KDE automatic switching = {original.get('auto') or 'not set'}, theme = {original.get('package') or BUILTIN_LIGHT}"
+    try:
+        notify("Theme scheduler stopped", f"Your original KDE settings are back: {summary}.")
+    except SchedulerError as exc:
+        log(f"could not send notification: {exc}")
+    print(f"Restored your original settings ({summary}). The scheduler is stopped and disabled.")
+    return 0
+
+
+def cmd_failure_test(args: argparse.Namespace) -> int:
+    if not (UNIT_DIR / SERVICE).exists() or not (UNIT_DIR / RECOVER_SERVICE).exists():
+        raise SchedulerError(f"run '{APP} install' first, the test uses the installed recovery unit")
+    if unit_prop(SERVICE, "ActiveState") in ACTIVE_STATES:
+        raise SchedulerError(f"stop the real scheduler first: systemctl --user stop {SERVICE}")
+    load_config()
+    results: list[bool] = []
+
+    def check(ok: bool, label: str) -> None:
+        results.append(ok)
+        print(f"  {'PASS' if ok else 'FAIL'}  {label}", flush=True)
+
+    def start() -> None:
+        systemctl_quiet("reset-failed", TEST_SERVICE)
+        systemctl("start", TEST_SERVICE)
+
+    def wait_for_recovery(previous: str, timeout: float) -> str:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            invocation = unit_prop(RECOVER_SERVICE, "InvocationID")
+            if invocation and invocation != previous and unit_prop(RECOVER_SERVICE, "ActiveState") in ("inactive", "failed"):
+                return invocation
+            time.sleep(0.5)
+        raise SchedulerError("the recovery unit did not run in time")
+
+    work = Path(tempfile.mkdtemp(prefix=f"{APP}-test-"))
+    original_file = work / "original.json"
+    test_unit = UNIT_DIR / TEST_SERVICE
+    before = settings_snapshot()
+    alert_before = ALERT_PATH.read_bytes() if ALERT_PATH.exists() else None
+    print(f"Failure test: dry-run copy with a {TEST_WATCHDOG_SEC}s watchdog. No theme is switched.")
+    try:
+        test_unit.write_text(
+            service_unit("theme-scheduler failure test (dry run)", TEST_WATCHDOG_SEC, "run --dry-run",
+                         state_dir=work, install=False)
+        )
+        systemctl("daemon-reload")
+
+        start()
+        check(unit_prop(TEST_SERVICE, "ActiveState") == "active", "test scheduler started and sent READY")
+        check(kread(AUTO_KEY) == "false", "takeover: KDE's automatic switching turned off")
+
+        previous = unit_prop(RECOVER_SERVICE, "InvocationID")
+        os.kill(int(unit_prop(TEST_SERVICE, "MainPID")), signal.SIGKILL)
+        run_id = wait_for_recovery(previous, 30)
+        check(unit_prop(TEST_SERVICE, "Result") == "signal", "crash: systemd noticed the process died (result=signal)")
+        check(journal_has(run_id, "alert notification sent"), "crash: recovery ran and sent the critical notification")
+        check(kread(AUTO_KEY) == "true", "crash: KDE's own sunrise/sunset switching is back on")
+
+        start()
+        pid = int(unit_prop(TEST_SERVICE, "MainPID"))
+        previous = unit_prop(RECOVER_SERVICE, "InvocationID")
+        os.kill(pid, signal.SIGSTOP)
+        run_id = wait_for_recovery(previous, TEST_WATCHDOG_SEC + 60)
+        check(unit_prop(TEST_SERVICE, "Result") == "watchdog", "hang: watchdog noticed the missing heartbeat (result=watchdog)")
+        check(not process_alive(pid), "hang: the frozen process was killed")
+        check(journal_has(run_id, "alert notification sent"), "hang: recovery ran and sent the critical notification")
+        check(kread(AUTO_KEY) == "true", "hang: KDE's own sunrise/sunset switching is back on")
+
+        start()
+        previous = unit_prop(RECOVER_SERVICE, "InvocationID")
+        systemctl("stop", TEST_SERVICE)
+        check(unit_prop(RECOVER_SERVICE, "InvocationID") == previous, "clean stop: no alarm raised")
+        check(kread(AUTO_KEY) == "true", "clean stop: KDE's own switching handed back")
+
+        original = read_json(original_file)
+        check(original is not None, "the scheduler saved your original settings")
+        if original is not None:
+            restore_settings(original)
+            original_file.unlink()
+            check(settings_snapshot() == before, "manual restore put your original settings back")
+    except SchedulerError as exc:
+        check(False, f"test stopped early: {exc}")
+    finally:
+        if unit_prop(TEST_SERVICE, "ActiveState") in ACTIVE_STATES:
+            systemctl_quiet("stop", TEST_SERVICE)
+        leftover = read_json(original_file)
+        if leftover is not None:
+            restore_settings(leftover)
+        test_unit.unlink(missing_ok=True)
+        systemctl_quiet("daemon-reload")
+        systemctl_quiet("reset-failed", TEST_SERVICE)
+        shutil.rmtree(work, ignore_errors=True)
+        if alert_before is None:
+            ALERT_PATH.unlink(missing_ok=True)
+        else:
+            ALERT_PATH.write_bytes(alert_before)
+    check(settings_snapshot() == before, "KDE settings identical to before the test")
+    ok = all(results)
+    print("RESULT: PASS. Recovery works." if ok else "RESULT: FAIL. Do not enable the scheduler yet.")
+    return 0 if ok else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog=APP, description="Dark/light KDE theme at sunset and sunrise, with offsets.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("install", help="write config and systemd units, save your current settings (does not enable)")
+    sub.add_parser("enable", help="start now and at every login")
+    sub.add_parser("status", help="show times, service state, KDE state and alerts")
+    times = sub.add_parser("times", help="show the next theme changes")
+    times.add_argument("-n", "--count", type=int, default=6)
+    sub.add_parser("restore", help="stop and disable the scheduler, put back your original settings")
+    sub.add_parser("failure-test", help="crash and hang a dry-run copy to prove recovery works")
+    run_parser = sub.add_parser("run", help=argparse.SUPPRESS)
+    run_parser.add_argument("--dry-run", action="store_true")
+    recover_parser = sub.add_parser("recover", help=argparse.SUPPRESS)
+    recover_parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+    commands = {
+        "install": cmd_install,
+        "enable": cmd_enable,
+        "status": cmd_status,
+        "times": cmd_times,
+        "restore": cmd_restore,
+        "failure-test": cmd_failure_test,
+        "run": cmd_run,
+        "recover": cmd_recover,
+    }
+    try:
+        return commands[args.command](args)
+    except SchedulerError as exc:
+        print(f"{APP}: error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
